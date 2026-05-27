@@ -1,0 +1,13 @@
+name: CI Main - Roboshop Cart
+on:
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - 'db/**'
+      - '.github/workflows/ci-db-main.yml'
+  workflow_dispatch:
+
+jobs:
+  cicd:
+    uses: raghudevopsb88/github-reusable-workflows/.github/workflows/cicd-m.yml@main

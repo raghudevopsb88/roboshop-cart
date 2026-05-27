@@ -1,0 +1,6 @@
+.git
+.github
+Makefile
+Dockerfile
+.dockerignore
+db

@@ -1,0 +1,12 @@
+name: CI Branch - Roboshop Cart
+on:
+  push:
+    branches-ignore:
+      - main
+    paths-ignore:
+      - 'db/**'
+      - '.github/workflows/ci-db-main.yml'
+
+jobs:
+  cicd:
+    uses: raghudevopsb88/github-reusable-workflows/.github/workflows/ci-b.yml@main
