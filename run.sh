@@ -8,8 +8,13 @@ if [ -f /data/params ]; then
     set +a
 fi
 
-export REDIS_HOST="${REDIS_HOST:-redis}"
-export CATALOGUE_URL="${CATALOGUE_URL:-http://${CATALOGUE_HOST:-roboshop-catalogue}:${CATALOGUE_PORT:-8080}}"
-export PORT="${CART_SERVER_PORT:-8080}"
+: "${REDIS_HOST:?REDIS_HOST is required}"
+: "${CATALOGUE_HOST:?CATALOGUE_HOST is required}"
+: "${CATALOGUE_PORT:?CATALOGUE_PORT is required}"
+: "${CART_SERVER_PORT:?CART_SERVER_PORT is required}"
+
+export REDIS_HOST
+export CATALOGUE_URL="http://${CATALOGUE_HOST}:${CATALOGUE_PORT}"
+export PORT="${CART_SERVER_PORT}"
 
 exec node server.js
