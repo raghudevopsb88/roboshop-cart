@@ -23,7 +23,10 @@ function logError(context, err, extra = '') {
     console.error(`[cart] ${context}${extra ? ` ${extra}` : ''}: ${detail}`);
 }
 
-async function connectRedis() {
+function initRedisClient() {
+    if (redisClient) {
+        return;
+    }
     redisClient = createClient({
         url: `redis://${REDIS_HOST}:6379`,
         socket: {
@@ -46,23 +49,21 @@ async function connectRedis() {
         redisReady = false;
         log(`Redis connection ended (host=${REDIS_HOST})`);
     });
+}
 
-    for (let i = 0; i < 30; i++) {
-        try {
-            await redisClient.connect();
-            redisReady = true;
-            log(`Connected to Redis at ${REDIS_HOST}:6379`);
-            return;
-        } catch (err) {
-            log(`Redis connection attempt ${i + 1}/30 failed: ${err.message}`);
-            await new Promise((resolve) => setTimeout(resolve, 2000));
-        }
+async function connectRedisOnce() {
+    initRedisClient();
+    if (redisClient.isOpen) {
+        redisReady = true;
+        return;
     }
-    throw new Error(`Failed to connect to Redis at ${REDIS_HOST}:6379`);
+    await redisClient.connect();
+    redisReady = true;
+    log(`Connected to Redis at ${REDIS_HOST}:6379`);
 }
 
 function ensureRedis(req, res, next) {
-    if (!redisReady || !redisClient?.isReady) {
+    if (!redisClient || !redisReady || !redisClient.isReady) {
         logError(
             'Request rejected — Redis unavailable',
             new Error('not ready'),
@@ -118,7 +119,7 @@ async function fetchProduct(productId) {
 }
 
 app.get('/health', async (req, res) => {
-    if (!redisReady || !redisClient?.isReady) {
+    if (!redisClient || !redisReady || !redisClient.isReady) {
         return res.status(503).json({ status: 'DOWN', service: 'cart', redis: 'disconnected' });
     }
     try {
@@ -247,13 +248,21 @@ process.on('uncaughtException', (err) => {
     logError('Uncaught exception', err);
 });
 
-connectRedis()
-    .then(() => {
-        app.listen(PORT, () => {
-            log(`Cart service listening on port ${PORT} (redis=${REDIS_HOST}, catalogue=${CATALOGUE_URL})`);
-        });
-    })
-    .catch((err) => {
-        logError('Startup failed', err);
-        process.exit(1);
-    });
+async function connectRedisWithRetry() {
+    for (let attempt = 1; attempt <= 30; attempt++) {
+        try {
+            await connectRedisOnce();
+            return;
+        } catch (err) {
+            log(`Redis connection attempt ${attempt}/30 failed: ${err.message}`);
+            await new Promise((resolve) => setTimeout(resolve, 2000));
+        }
+    }
+    logError('Redis unavailable after 30 attempts', new Error('giving up initial burst'), `host=${REDIS_HOST}`);
+}
+
+// Listen immediately so nginx/kube probes get a TCP response (503 until Redis is ready).
+app.listen(PORT, () => {
+    log(`Cart HTTP listening on port ${PORT} (redis=${REDIS_HOST}, catalogue=${CATALOGUE_URL})`);
+    connectRedisWithRetry().catch((err) => logError('Redis background connect failed', err));
+});
