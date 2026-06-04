@@ -12,23 +12,76 @@ const PORT = process.env.PORT || 8003;
 const CART_TTL = 3600; // 1 hour
 
 let redisClient;
+let redisReady = false;
+
+function log(msg) {
+    console.log(msg);
+}
+
+function logError(context, err, extra = '') {
+    const detail = err && err.stack ? err.stack : (err && err.message ? err.message : String(err));
+    console.error(`[cart] ${context}${extra ? ` ${extra}` : ''}: ${detail}`);
+}
 
 async function connectRedis() {
-    redisClient = createClient({ url: `redis://${REDIS_HOST}:6379` });
-    redisClient.on('error', (err) => console.error('Redis error:', err));
+    redisClient = createClient({
+        url: `redis://${REDIS_HOST}:6379`,
+        socket: {
+            connectTimeout: 10_000,
+            reconnectStrategy: (retries) => Math.min(retries * 200, 3000),
+        },
+    });
+
+    redisClient.on('error', (err) => {
+        redisReady = false;
+        logError('Redis client error', err, `host=${REDIS_HOST}`);
+    });
+
+    redisClient.on('ready', () => {
+        redisReady = true;
+        log(`Redis ready (host=${REDIS_HOST})`);
+    });
+
+    redisClient.on('end', () => {
+        redisReady = false;
+        log(`Redis connection ended (host=${REDIS_HOST})`);
+    });
 
     for (let i = 0; i < 30; i++) {
         try {
             await redisClient.connect();
-            console.log('Connected to Redis');
+            redisReady = true;
+            log(`Connected to Redis at ${REDIS_HOST}:6379`);
             return;
         } catch (err) {
-            console.log(`Redis connection attempt ${i + 1}/30 failed, retrying in 2s...`);
-            await new Promise(resolve => setTimeout(resolve, 2000));
+            log(`Redis connection attempt ${i + 1}/30 failed: ${err.message}`);
+            await new Promise((resolve) => setTimeout(resolve, 2000));
         }
     }
-    throw new Error('Failed to connect to Redis');
+    throw new Error(`Failed to connect to Redis at ${REDIS_HOST}:6379`);
 }
+
+function ensureRedis(req, res, next) {
+    if (!redisReady || !redisClient?.isReady) {
+        logError(
+            'Request rejected — Redis unavailable',
+            new Error('not ready'),
+            `${req.method} ${req.originalUrl}`
+        );
+        return res.status(503).json({ error: 'Cart storage unavailable' });
+    }
+    next();
+}
+
+app.use((req, res, next) => {
+    const start = Date.now();
+    log(`>> ${req.method} ${req.originalUrl}`);
+    res.on('finish', () => {
+        const ms = Date.now() - start;
+        log(`<< ${req.method} ${req.originalUrl} ${res.statusCode} ${ms}ms`);
+    });
+    next();
+});
 
 function cartKey(userId) {
     return `cart:${userId}`;
@@ -43,39 +96,70 @@ async function saveCart(userId, cart) {
     await redisClient.setEx(cartKey(userId), CART_TTL, JSON.stringify(cart));
 }
 
-// Health check
-app.get('/health', (req, res) => {
-    res.json({ status: 'OK', service: 'cart' });
+async function fetchProduct(productId) {
+    const url = `${CATALOGUE_URL}/products/${productId}`;
+    let response;
+    try {
+        response = await fetch(url, { signal: AbortSignal.timeout(15_000) });
+    } catch (err) {
+        logError('Catalogue fetch failed', err, `url=${url}`);
+        throw err;
+    }
+    if (!response.ok) {
+        const body = await response.text().catch(() => '');
+        logError(
+            'Catalogue returned error',
+            new Error(`HTTP ${response.status}`),
+            `url=${url} body=${body.slice(0, 200)}`
+        );
+        return null;
+    }
+    return response.json();
+}
+
+app.get('/health', async (req, res) => {
+    if (!redisReady || !redisClient?.isReady) {
+        return res.status(503).json({ status: 'DOWN', service: 'cart', redis: 'disconnected' });
+    }
+    try {
+        await redisClient.ping();
+        res.json({ status: 'OK', service: 'cart', redis: REDIS_HOST });
+    } catch (err) {
+        logError('Health check Redis ping failed', err);
+        res.status(503).json({ status: 'DOWN', service: 'cart', redis: 'ping failed' });
+    }
 });
 
-// Get cart
+app.use(ensureRedis);
+
 app.get('/cart/:userId', async (req, res) => {
+    const { userId } = req.params;
     try {
-        const cart = await getCart(req.params.userId);
+        const cart = await getCart(userId);
+        log(`Get cart ${userId}: ${cart.items.length} item(s)`);
         res.json(cart);
     } catch (err) {
-        console.error('Get cart error:', err.message);
+        logError('Get cart failed', err, `userId=${userId}`);
         res.status(500).json({ error: 'Failed to get cart' });
     }
 });
 
-// Add to cart
 app.post('/cart/:userId/add', async (req, res) => {
+    const { userId } = req.params;
     try {
         const { productId, quantity = 1 } = req.body;
-        const cart = await getCart(req.params.userId);
+        if (!productId) {
+            log(`Add to cart ${userId} rejected: missing productId`);
+            return res.status(400).json({ error: 'productId is required' });
+        }
 
-        // Fetch product info from catalogue service
-        let product;
-        try {
-            const response = await fetch(`${CATALOGUE_URL}/products/${productId}`);
-            if (!response.ok) throw new Error('Product not found');
-            product = await response.json();
-        } catch (err) {
+        const cart = await getCart(userId);
+        const product = await fetchProduct(productId);
+        if (!product) {
             return res.status(400).json({ error: 'Product not found in catalogue' });
         }
 
-        const existingItem = cart.items.find(item => item.productId === productId);
+        const existingItem = cart.items.find((item) => item.productId === productId);
         if (existingItem) {
             existingItem.quantity += quantity;
         } else {
@@ -84,70 +168,92 @@ app.post('/cart/:userId/add', async (req, res) => {
                 name: product.name,
                 price: product.price,
                 sku: product.sku,
-                quantity
+                quantity,
             });
         }
 
-        await saveCart(req.params.userId, cart);
-        console.log(`Added product ${productId} to cart ${req.params.userId}`);
+        await saveCart(userId, cart);
+        log(`Added product ${productId} to cart ${userId} (qty=${quantity}, items=${cart.items.length})`);
         res.json(cart);
     } catch (err) {
-        console.error('Add to cart error:', err.message);
+        logError('Add to cart failed', err, `userId=${userId} body=${JSON.stringify(req.body)}`);
         res.status(500).json({ error: 'Failed to add to cart' });
     }
 });
 
-// Update item quantity
 app.put('/cart/:userId/update', async (req, res) => {
+    const { userId } = req.params;
     try {
         const { productId, quantity } = req.body;
-        const cart = await getCart(req.params.userId);
+        if (!productId || quantity === undefined) {
+            log(`Update cart ${userId} rejected: missing productId or quantity`);
+            return res.status(400).json({ error: 'productId and quantity are required' });
+        }
 
-        const item = cart.items.find(item => item.productId === productId);
+        const cart = await getCart(userId);
+        const item = cart.items.find((i) => i.productId === productId);
         if (!item) {
+            log(`Update cart ${userId} failed: product ${productId} not in cart`);
             return res.status(404).json({ error: 'Item not found in cart' });
         }
 
         if (quantity <= 0) {
-            cart.items = cart.items.filter(item => item.productId !== productId);
+            cart.items = cart.items.filter((i) => i.productId !== productId);
         } else {
             item.quantity = quantity;
         }
 
-        await saveCart(req.params.userId, cart);
+        await saveCart(userId, cart);
+        log(`Updated cart ${userId}: product ${productId} qty=${quantity} items=${cart.items.length}`);
         res.json(cart);
     } catch (err) {
-        console.error('Update cart error:', err.message);
+        logError('Update cart failed', err, `userId=${userId} body=${JSON.stringify(req.body)}`);
         res.status(500).json({ error: 'Failed to update cart' });
     }
 });
 
-// Remove item
 app.delete('/cart/:userId/item/:productId', async (req, res) => {
+    const { userId, productId } = req.params;
     try {
-        const cart = await getCart(req.params.userId);
-        cart.items = cart.items.filter(item => String(item.productId) !== req.params.productId);
-        await saveCart(req.params.userId, cart);
+        const cart = await getCart(userId);
+        const before = cart.items.length;
+        cart.items = cart.items.filter((item) => String(item.productId) !== productId);
+        await saveCart(userId, cart);
+        log(`Removed product ${productId} from cart ${userId} (${before} -> ${cart.items.length} items)`);
         res.json(cart);
     } catch (err) {
-        console.error('Remove from cart error:', err.message);
+        logError('Remove from cart failed', err, `userId=${userId} productId=${productId}`);
         res.status(500).json({ error: 'Failed to remove from cart' });
     }
 });
 
-// Clear cart
 app.delete('/cart/:userId', async (req, res) => {
+    const { userId } = req.params;
     try {
-        await redisClient.del(cartKey(req.params.userId));
+        await redisClient.del(cartKey(userId));
+        log(`Cleared cart ${userId}`);
         res.json({ status: 'ok' });
     } catch (err) {
-        console.error('Clear cart error:', err.message);
+        logError('Clear cart failed', err, `userId=${userId}`);
         res.status(500).json({ error: 'Failed to clear cart' });
     }
 });
 
-connectRedis().then(() => {
-    app.listen(PORT, () => {
-        console.log(`Cart service listening on port ${PORT}`);
-    });
+process.on('unhandledRejection', (reason) => {
+    logError('Unhandled promise rejection', reason);
 });
+
+process.on('uncaughtException', (err) => {
+    logError('Uncaught exception', err);
+});
+
+connectRedis()
+    .then(() => {
+        app.listen(PORT, () => {
+            log(`Cart service listening on port ${PORT} (redis=${REDIS_HOST}, catalogue=${CATALOGUE_URL})`);
+        });
+    })
+    .catch((err) => {
+        logError('Startup failed', err);
+        process.exit(1);
+    });
