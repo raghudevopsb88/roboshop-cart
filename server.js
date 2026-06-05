@@ -262,9 +262,27 @@ async function connectRedisWithRetry() {
 }
 
 // Listen immediately so nginx/kube probes get a TCP response (503 until Redis is ready).
-app.listen(PORT, () => {
+const httpServer = app.listen(PORT, () => {
     log(`Cart HTTP listening on port ${PORT} (redis=${REDIS_HOST}, catalogue=${CATALOGUE_URL})`);
     connectRedisWithRetry().catch((err) => logError('Redis background connect failed', err));
 });
 
-/////
+function shutdown(signal) {
+    log(`Received ${signal}, draining HTTP connections...`);
+    httpServer.close(() => {
+        log('HTTP server closed');
+        const done = () => process.exit(0);
+        if (redisClient?.isOpen) {
+            redisClient.quit().then(done).catch(done);
+        } else {
+            done();
+        }
+    });
+    setTimeout(() => {
+        logError('Forced exit after graceful shutdown timeout', new Error('SIGTERM timeout'));
+        process.exit(1);
+    }, 25000).unref();
+}
+
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));
