@@ -266,3 +266,5 @@ app.listen(PORT, () => {
     log(`Cart HTTP listening on port ${PORT} (redis=${REDIS_HOST}, catalogue=${CATALOGUE_URL})`);
     connectRedisWithRetry().catch((err) => logError('Redis background connect failed', err));
 });
+
+//
